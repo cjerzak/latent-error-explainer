@@ -9,7 +9,6 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MARKDOWN = ROOT / "latent_predictor_visualization_slide_script.md"
 DEFAULT_MEDIA_DIR = ROOT / "media/videos/latent_predictor_scaling_manim"
 TTS_URL = "https://api.x.ai/v1/tts"
-SECTION_CLIP_COUNTS = [6, 9, 8, 8, 4]
+TRANSITION_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -33,9 +32,33 @@ class RenderSpec:
     height: int
 
 
+@dataclass(frozen=True)
+class VideoSegment:
+    name: str
+    clip_start: int
+    clip_end: int
+    audio_index: int | None
+    target_seconds: float | None = None
+
+
 RENDERS = [
     RenderSpec("720p30", fps=30, width=1280, height=720),
     RenderSpec("480p15", fps=15, width=854, height=480),
+]
+
+VIDEO_SEGMENTS = [
+    VideoSegment("slide_01", clip_start=1, clip_end=6, audio_index=0),
+    VideoSegment("slide_02", clip_start=7, clip_end=14, audio_index=1),
+    VideoSegment(
+        "transition_02_to_03",
+        clip_start=15,
+        clip_end=16,
+        audio_index=None,
+        target_seconds=TRANSITION_SECONDS,
+    ),
+    VideoSegment("slide_03", clip_start=17, clip_end=23, audio_index=2),
+    VideoSegment("slide_04", clip_start=24, clip_end=31, audio_index=3),
+    VideoSegment("slide_05", clip_start=32, clip_end=35, audio_index=4),
 ]
 
 CONCISE_SECTIONS = [
@@ -48,14 +71,13 @@ CONCISE_SECTIONS = [
     (
         "The top row is X with variance one. Add error and tilde X spreads out; its "
         "standard deviation grows with sigma U squared. But the regression score is "
-        "X hat, standardized again. More noise widens the estimate, then identification "
+        "X hat, standardized again. Noise widens the estimate; standardization "
         "compresses it back."
     ),
     (
-        "That rescaling changes attenuation. In classical error, the slope is multiplied "
-        "by one over one plus sigma U squared because the predictor's variance is inflated. "
-        "For an identified latent score, standardization removes that inflation, leaving "
-        "one over the square root of one plus sigma U squared."
+        "Rescaling changes attenuation. Classical error multiplies the slope by one "
+        "over one plus sigma U squared. Identified latent scores remove the variance "
+        "inflation, leaving the square-root factor."
     ),
     (
         "Split indicators estimate the correction. Build two scores from disjoint "
@@ -278,8 +300,10 @@ def concat_video(clips: list[Path], output_path: Path, scratch_dir: Path) -> Non
 
 
 def concat_audio(audio_paths: list[Path], output_path: Path, scratch_dir: Path) -> None:
-    concat_file = scratch_dir / f"{output_path.stem}_audio_concat.txt"
-    write_concat_list(audio_paths, concat_file)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    inputs = [["-i", str(path)] for path in audio_paths]
+    input_args = [arg for pair in inputs for arg in pair]
+    filter_inputs = "".join(f"[{index}:a]" for index in range(len(audio_paths)))
     run(
         [
             "ffmpeg",
@@ -287,12 +311,11 @@ def concat_audio(audio_paths: list[Path], output_path: Path, scratch_dir: Path) 
             "-hide_banner",
             "-loglevel",
             "warning",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
+            *input_args,
+            "-filter_complex",
+            f"{filter_inputs}concat=n={len(audio_paths)}:v=0:a=1[a]",
+            "-map",
+            "[a]",
             "-c:a",
             "libmp3lame",
             "-q:a",
@@ -302,38 +325,68 @@ def concat_audio(audio_paths: list[Path], output_path: Path, scratch_dir: Path) 
     )
 
 
-def split_sections(clips: list[Path]) -> list[list[Path]]:
-    if sum(SECTION_CLIP_COUNTS) != len(clips):
+def create_silence_audio(output_path: Path, seconds: float) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=mono",
+            "-t",
+            f"{seconds:.3f}",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+
+def segment_audio_sequence(audio_paths: list[Path], silence_audio_path: Path) -> list[Path]:
+    sequence: list[Path] = []
+    for segment in VIDEO_SEGMENTS:
+        if segment.audio_index is None:
+            sequence.append(silence_audio_path)
+        else:
+            sequence.append(audio_paths[segment.audio_index])
+    return sequence
+
+
+def split_video_segments(clips: list[Path]) -> list[tuple[VideoSegment, list[Path]]]:
+    expected_clip_count = max(segment.clip_end for segment in VIDEO_SEGMENTS)
+    if expected_clip_count != len(clips):
         raise SystemExit(
-            f"Expected {sum(SECTION_CLIP_COUNTS)} clips but found {len(clips)}; section map needs updating."
+            f"Expected {expected_clip_count} clips but found {len(clips)}; segment map needs updating."
         )
-    sections: list[list[Path]] = []
-    offset = 0
-    for count in SECTION_CLIP_COUNTS:
-        sections.append(clips[offset : offset + count])
-        offset += count
-    return sections
+    return [
+        (segment, clips[segment.clip_start - 1 : segment.clip_end])
+        for segment in VIDEO_SEGMENTS
+    ]
 
 
-def retime_video_to_audio(
+def retime_video_to_duration(
     video_path: Path,
-    audio_path: Path,
     output_path: Path,
     *,
+    target_duration: float,
     fps: int,
     width: int,
     height: int,
 ) -> None:
     video_duration = probe_duration(video_path)
-    audio_duration = probe_duration(audio_path)
-    ratio = audio_duration / video_duration
+    ratio = target_duration / video_duration
     scale_filter = (
         f"setpts={ratio:.9f}*PTS,"
         f"scale={width}:{height}:flags=lanczos,"
         f"fps={fps},format=yuv420p"
     )
     print(
-        f"Retiming {video_path.name}: video={video_duration:.2f}s audio={audio_duration:.2f}s ratio={ratio:.3f}"
+        f"Retiming {video_path.name}: video={video_duration:.2f}s target={target_duration:.2f}s ratio={ratio:.3f}"
     )
     run(
         [
@@ -357,6 +410,26 @@ def retime_video_to_audio(
             "yuv420p",
             str(output_path),
         ]
+    )
+
+
+def retime_video_to_audio(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    *,
+    fps: int,
+    width: int,
+    height: int,
+) -> None:
+    audio_duration = probe_duration(audio_path)
+    retime_video_to_duration(
+        video_path,
+        output_path,
+        target_duration=audio_duration,
+        fps=fps,
+        width=width,
+        height=height,
     )
 
 
@@ -414,18 +487,30 @@ def process_render(
     concat_video(clips, base_video, scratch_dir)
 
     section_videos: list[Path] = []
-    for index, section_clips in enumerate(split_sections(clips), start=1):
-        section_base = scratch_dir / f"section_{index:02d}_base.mp4"
-        section_timed = scratch_dir / f"section_{index:02d}_timed.mp4"
+    for index, (segment, section_clips) in enumerate(split_video_segments(clips), start=1):
+        section_base = scratch_dir / f"segment_{index:02d}_{segment.name}_base.mp4"
+        section_timed = scratch_dir / f"segment_{index:02d}_{segment.name}_timed.mp4"
         concat_video(section_clips, section_base, scratch_dir)
-        retime_video_to_audio(
-            section_base,
-            audio_paths[index - 1],
-            section_timed,
-            fps=render.fps,
-            width=render.width,
-            height=render.height,
-        )
+        if segment.audio_index is None:
+            if segment.target_seconds is None:
+                raise SystemExit(f"Segment {segment.name} needs target_seconds.")
+            retime_video_to_duration(
+                section_base,
+                section_timed,
+                target_duration=segment.target_seconds,
+                fps=render.fps,
+                width=render.width,
+                height=render.height,
+            )
+        else:
+            retime_video_to_audio(
+                section_base,
+                audio_paths[segment.audio_index],
+                section_timed,
+                fps=render.fps,
+                width=render.width,
+                height=render.height,
+            )
         section_videos.append(section_timed)
 
     timed_silent = media_dir / render.quality_dir / "LatentPredictorScalingDynamics_timed_silent.mp4"
@@ -481,8 +566,12 @@ def main() -> int:
         )
         audio_paths.append(audio_path)
 
+    silence_audio_path = voice_dir / f"silence_{TRANSITION_SECONDS:.1f}s.wav"
+    create_silence_audio(silence_audio_path, TRANSITION_SECONDS)
+    full_audio_sequence = segment_audio_sequence(audio_paths, silence_audio_path)
+
     full_audio_path = voice_dir / f"LatentPredictorScalingDynamics_voiceover_{args.voice_id}.mp3"
-    concat_audio(audio_paths, full_audio_path, voice_dir / "scratch")
+    concat_audio(full_audio_sequence, full_audio_path, voice_dir / "scratch")
 
     output_suffix = "" if args.script_mode == "concise" else "_fullscript"
     upload_paths = [
