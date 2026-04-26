@@ -22,6 +22,7 @@ DEFAULT_MARKDOWN = ROOT / "latent_predictor_visualization_slide_script.md"
 DEFAULT_MEDIA_DIR = ROOT / "media/videos/latent_predictor_scaling_manim"
 TTS_URL = "https://api.x.ai/v1/tts"
 TRANSITION_SECONDS = 2.0
+CONTROL_TOKEN_RE = re.compile(r"\[[A-Za-z][A-Za-z0-9_-]*\]")
 
 
 @dataclass(frozen=True)
@@ -156,7 +157,7 @@ def probe_duration(path: Path) -> float:
 
 def voiceover_sections(markdown_path: Path, mode: str, include_closing: bool) -> list[str]:
     if mode == "concise":
-        return add_section_pauses([normalize_for_tts(section) for section in CONCISE_SECTIONS])
+        return [normalize_for_tts(section) for section in CONCISE_SECTIONS]
 
     return parse_markdown_voiceover_sections(markdown_path, include_closing)
 
@@ -175,12 +176,8 @@ def parse_markdown_voiceover_sections(markdown_path: Path, include_closing: bool
     if include_closing:
         closing = re.search(r'## Optional short closing line\s*\n\s*"(.+?)"', text, flags=re.S)
         if closing:
-            cleaned[-1] = f"{cleaned[-1]} [long-pause] {normalize_for_tts(closing.group(1))}"
-    return add_section_pauses(cleaned)
-
-
-def add_section_pauses(sections: list[str]) -> list[str]:
-    return [f"{section} [pause]" if idx < 4 else section for idx, section in enumerate(sections)]
+            cleaned[-1] = f"{cleaned[-1]} {normalize_for_tts(closing.group(1))}"
+    return cleaned
 
 
 def normalize_for_tts(text: str) -> str:
@@ -221,6 +218,11 @@ def synthesize_tts(
     if output_path.exists() and not force:
         print(f"Using cached TTS: {output_path}")
         return
+
+    control_tokens = sorted(set(CONTROL_TOKEN_RE.findall(text)))
+    if control_tokens:
+        tokens = ", ".join(control_tokens)
+        raise ValueError(f"Refusing to send control token(s) to TTS: {tokens}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -355,6 +357,11 @@ def segment_audio_sequence(audio_paths: list[Path], silence_audio_path: Path) ->
         else:
             sequence.append(audio_paths[segment.audio_index])
     return sequence
+
+
+def voiceover_dir(media_dir: Path, voice_id: str, script_mode: str) -> Path:
+    mode_dir = "fullscript" if script_mode == "full" else script_mode
+    return media_dir / f"xai_voiceover_{voice_id}_{mode_dir}"
 
 
 def split_video_segments(clips: list[Path]) -> list[tuple[VideoSegment, list[Path]]]:
@@ -532,6 +539,14 @@ def main() -> int:
     parser.add_argument("--voice-id", default="ara")
     parser.add_argument("--script-mode", choices=["concise", "full"], default="concise")
     parser.add_argument("--force-tts", action="store_true")
+    parser.add_argument(
+        "--force-tts-section",
+        type=int,
+        action="append",
+        choices=range(1, 6),
+        metavar="{1,2,3,4,5}",
+        help="Regenerate one 1-based voiceover section; may be passed more than once.",
+    )
     parser.add_argument("--include-closing", dest="include_closing", action="store_true", default=None)
     parser.add_argument("--no-include-closing", dest="include_closing", action="store_false")
     args = parser.parse_args()
@@ -541,7 +556,7 @@ def main() -> int:
     if include_closing is None:
         include_closing = args.script_mode == "full"
     sections = voiceover_sections(args.markdown, args.script_mode, include_closing=include_closing)
-    voice_dir = args.media_dir / f"xai_voiceover_{args.voice_id}_{args.script_mode}"
+    voice_dir = voiceover_dir(args.media_dir, args.voice_id, args.script_mode)
     voice_dir.mkdir(parents=True, exist_ok=True)
 
     (voice_dir / "spoken_script.json").write_text(
@@ -555,6 +570,7 @@ def main() -> int:
     )
 
     audio_paths: list[Path] = []
+    force_tts_sections = set(args.force_tts_section or [])
     for index, text in enumerate(sections, start=1):
         audio_path = voice_dir / f"slide_{index:02d}_{args.voice_id}.mp3"
         synthesize_tts(
@@ -562,7 +578,7 @@ def main() -> int:
             audio_path,
             api_key=api_key,
             voice_id=args.voice_id,
-            force=args.force_tts,
+            force=args.force_tts or index in force_tts_sections,
         )
         audio_paths.append(audio_path)
 
